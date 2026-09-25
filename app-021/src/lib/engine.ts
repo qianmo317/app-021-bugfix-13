@@ -145,30 +145,32 @@ interface History {
 }
 
 // 从已有排里重建历史状态（用于「从第 N 周起重排」时保留已过周次的影响）
+// 必须逐周累计全部已生成周次，与 finalize() 的累计方式完全一致（按周升序累加，
+// 浮点累加顺序也与 generatePlan 相同），这样增量重排/补排的结果才与一次生成整学期对得上。
 function buildHistory(p: Prepared, assignments: Assignment[]): History {
   const cumScore = new Float64Array(p.n)
   const cumFront = new Float64Array(p.n)
   const deskCount = new Map<number, number>()
   const sorted = [...assignments].sort((a, b) => a.week - b.week)
-  const seatByStudent = new Map<number, number>()
-  const last = sorted[sorted.length - 1]
-  if (last) {
-    for (const [seatId, studentId] of Object.entries(last.map)) {
+  for (const asg of sorted) {
+    const occOf = new Map<number, number>() // 座位下标 → 学生下标
+    for (const [seatId, studentId] of Object.entries(asg.map)) {
       const st = p.stIdx.get(studentId)
       const seat = p.idx.byId.get(seatId)
       if (st === undefined || seat === undefined) continue
-      seatByStudent.set(st, seat.row * p.idx.layout.cols + seat.col)
+      occOf.set(seat.row * p.idx.layout.cols + seat.col, st)
     }
-  }
-  for (const [st] of seatByStudent) {
-    cumScore[st] = p.idx.posScore[seatByStudent.get(st) ?? 0]
-    cumFront[st] = 1
-  }
-  for (const [st, si] of seatByStudent) {
-    for (const nb of p.idx.deskmates[si]) {
-      const other = seatByStudent.get(nb)
-      if (other === undefined || other <= st) continue
-      deskCount.set(pairKey(st, other), 1)
+    for (const [si, st] of occOf) {
+      cumScore[st] += p.idx.posScore[si]
+      if (p.idx.seats[si].row < p.frontRows) cumFront[st] += 1
+    }
+    for (const [si, st] of occOf) {
+      for (const nb of p.idx.deskmates[si]) {
+        const other = occOf.get(nb)
+        if (other === undefined || other <= st) continue
+        const key = pairKey(st, other)
+        deskCount.set(key, (deskCount.get(key) ?? 0) + 1)
+      }
     }
   }
   const weeksDone = sorted.length
@@ -532,9 +534,18 @@ class WeekState {
       const st = this.occ[si]
       if (st >= 0) map[p.idx.seats[si].id] = p.students[st].id
     }
+    // 历史累计直接按最终座位计算，而不是累加退火过程中的移动增量：
+    // 增量累加有浮点误差，会使历史状态偏离「已存座位表的纯函数」，
+    // buildHistory 重建历史时便无法与一次生成整学期逐位一致。
+    let sum = 0
+    let sum2 = 0
     for (let st = 0; st < p.n; st++) {
-      this.hist.cumScore[st] += this.weekScore[st]
-      this.hist.cumFront[st] += this.weekFront[st]
+      const si = this.seatOf[st]
+      const score = p.idx.posScore[si]
+      this.hist.cumScore[st] += score
+      this.hist.cumFront[st] += p.idx.seats[si].row < p.frontRows ? 1 : 0
+      sum += score
+      sum2 += score * score
     }
     for (let si = 0; si < p.S; si++) {
       const a = this.occ[si]
@@ -548,12 +559,6 @@ class WeekState {
       }
     }
     this.hist.weeksDone++
-    let sum = 0
-    let sum2 = 0
-    for (let st = 0; st < p.n; st++) {
-      sum += this.weekScore[st]
-      sum2 += this.weekScore[st] * this.weekScore[st]
-    }
     const fairness = Math.max(0, sum2 - (sum * sum) / p.n)
     let repeats = 0
     for (let si = 0; si < p.S; si++) {

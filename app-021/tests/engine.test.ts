@@ -110,6 +110,45 @@ describe('引擎：增量重生成（§8）', () => {
   })
 })
 
+describe('引擎：增量重生成携带历史累计，与一次生成整学期一致', () => {
+  it('从第 N 周起重排：结果与一次生成整学期完全一致', () => {
+    const cls = makeClass({ rows: 5, cols: 8, weeks: 20, seed: 42 })
+    const full = generatePlan(cls)
+    cls.assignments = full
+    expect(regenerateFrom(cls, 11)).toEqual(full)
+  })
+
+  it('补出后十周：与一次生成二十周完全一致', () => {
+    const cls = makeClass({ rows: 5, cols: 8, weeks: 20, seed: 42 })
+    const full = generatePlan(cls)
+    cls.assignments = full.slice(0, 10)
+    const filled = generateMissingWeeks(cls)
+    expect(filled).toHaveLength(20)
+    expect(filled).toEqual(full)
+  })
+
+  it('只重生成某一周：与整学期生成中该周完全一致', () => {
+    const cls = makeClass({ rows: 5, cols: 8, weeks: 20, seed: 42 })
+    const full = generatePlan(cls)
+    cls.assignments = full
+    for (const w of [1, 7, 20]) {
+      expect(regenerateSingleWeek(cls, w)).toEqual(full[w - 1])
+    }
+  })
+
+  it('周数调大补排后：同桌超限对为 0，报告同桌次数与逐周累计一致', () => {
+    const cls = makeClass({ rows: 5, cols: 8, weeks: 10, seed: 42 })
+    cls.assignments = generatePlan(cls)
+    cls.weeks = 20 // 把周数调大，补出后十周
+    cls.assignments = generateMissingWeeks(cls)
+    expect(cls.assignments).toHaveLength(20)
+    const report = computeFairness(cls)
+    expect(report.deskmateOverLimit).toHaveLength(0)
+    expect(report.hardViolations).toHaveLength(0)
+    expect(report.rows.every((r) => r.maxDeskmateRepeat <= 2)).toBe(true)
+  })
+})
+
 describe('公平性与交换（手工微调）', () => {
   it('weekStats 与 previewSwap 正确反映交换影响', () => {
     const cls = makeClass({ rows: 3, cols: 4, weeks: 4, seed: 11 })
