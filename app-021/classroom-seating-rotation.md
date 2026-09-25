@@ -67,8 +67,8 @@ class InfeasibleError extends Error {}
 - **代价常量**：`W_HEIGHT = 4`（身高序违背）、`W_MIX = 2`（同桌同分层）、`FRESH_PAIR = 0.3`（新同桌微奖励），同桌第 1 / 2 / 3 次重复为 `REPEAT1 = 3`、`REPEAT2 = 60`、`REPEAT3 = 500`（`engine.ts:12-17`）；同桌对用 `pairKey(a,b) = a*4096+b` 编码（`engine.ts:110-112`）。
 - **初始分配**：固定座位学生先落位；其余学生按「可行座位数从少到多」贪心，每人在可行座位中随机挑一个；无可行座位时抛 `InfeasibleError` 并说明是哪一类座位不足（`engine.ts:179-223`）。
 - **模拟退火**：`iters = min(60000, max(15000, n*400))`，温度从 `T0 = 3.0` 按几何下降 `T = T0·(T1/T0)^(it/iters)` 到 `T1 = 0.02`；每步随机取一个非固定学生与一个随机座位做移动 / 交换，`Δ ≤ 0` 或 `rand < exp(-Δ/T)` 时接受（`engine.ts:468-492`）。退火后最多 200 轮贪心修复残余硬约束（`engine.ts:495-526`）；单周最多重试 `MAX_ATTEMPTS = 6` 次，仍不可行则抛错（`engine.ts:19,573-585`）。
-- **公平性目标**：最小化每人累计位置分的偏差平方和，同时最小化每人「前 N 排」次数相对理想值 `idealF = weeks × frontSeats / n` 的偏差平方和（`engine.ts:270,324-342`）。
-- **可复现与增量**：随机源为 `mulberry32` + `hashSeed(seed, week, attempt)`，生成路径不使用 `Math.random`（`src/lib/rng.ts`）；`generatePlan` / `regenerateFrom` / `regenerateSingleWeek` / `generateMissingWeeks` 通过 `buildHistory()` 复用已生成周次的累计位置分、前排计数与同桌次数，保证重排不影响目标周次之外的结果（`engine.ts:148-176,590-640`）。
+- **公平性目标**：最小化每人累计位置分的偏差平方和，同时最小化每人「前 N 排」次数相对理想值的偏差平方和。理想前排次数随**当前实际周次**推进：已生成 `weeksDone` 周、本周是第 `weeksDone+1` 周时 `idealF = (weeksDone+1) × frontSeats / n`（`engine.ts:284,324-354`）。它刻意不依赖计划总周数 `cls.weeks`，这样先排 10 周、再把周数调到 20 补齐时，每周看到的公平目标与「一次生成 20 周」完全相同。
+- **可复现与增量**：随机源为 `mulberry32` + `hashSeed(seed, week, attempt)`，生成路径不使用 `Math.random`（`src/lib/rng.ts`）；`generatePlan` / `regenerateFrom` / `regenerateSingleWeek` / `generateMissingWeeks` 通过 `buildHistory()` 复用已生成周次的**全部**历史——逐周累加累计位置分、前排计数与同桌次数（按座位邻接的无向对去重），不只是最后一周（`engine.ts:149-187`）。为保证「从已存 map 重建历史」与「顺序生成时在内存里累加历史」两条路径 bit 级一致，`finalize()` 以**最终座位**的位置分/前排标记作为本周权威值并入历史，避免「初始分 + 逐次交换增量」望远镜累加带来的 1 ULP 浮点偏差翻转退火接受判定（`engine.ts:543-562`）。由此三种增量做法（从某周起重排、补齐缺失周、只重生成某周）的结果都与一次生成整学期逐周一致（`engine.ts:614-665`、`tests/incremental.test.ts`）。
 - **公平性报告**：`variance = Σx² − (Σx)²/n`，`std = sqrt(variance/n)`；位置分按 `positionScore` 累计，前 N 排次数按 `row < frontRows` 计，前 / 中 / 后按 1/3 行划分；同桌重复按无向对去重统计，`count > 2` 进入超限列表（`src/lib/fairness.ts:132-253`）。手工交换前用 `previewSwap()` 复用同一套判定，违反数为 0 才允许提交（`fairness.ts:267-292`、`store.tsx:197-198`）。
 
 ## 9. 交互与视觉要点
@@ -86,7 +86,7 @@ class InfeasibleError extends Error {}
 - **同桌重复**：同配置 20 周，同桌超 2 次的对必须为 0（`tests/acceptance.test.ts:39-47`）。
 - **边界容量**：30 人坐 40 座（含空位）生成 8 周，每周映射恰好 30 条且硬约束违反为 0（`tests/acceptance.test.ts:49-59`）。
 - **可复现与性能**：同种子结果完全一致、不同种子第 1 周不同（`tests/engine.test.ts:12-26`）；40 人 × 20 周生成耗时 < 1000ms（`tests/engine.test.ts:153-163`）。
-- **测试规模**：vitest 30 个用例（acceptance 4 / engine 15 / layout 5 / rng 3 / csv 2 / storage 1），Playwright 13 个用例（journey 6 / sample 7）；E2E 针对 `vite preview`（4173）运行（`vitest.config.ts`、`playwright.config.ts`）。
+- **测试规模**：vitest 39 个用例（acceptance 4 / engine 15 / incremental 9 / layout 5 / rng 3 / csv 2 / storage 1），Playwright 13 个用例（journey 6 / sample 7）；E2E 针对 `vite preview`（4173）运行（`vitest.config.ts`、`playwright.config.ts`）。
 - **E2E 关键断言**：示例班级 40 人、5×8；生成 20 周后硬约束显示 0；固定座位学生被拖走时预览提示「违反硬约束」且座位不变；合法交换后硬约束仍为 0 且可撤销；刷新后 20 周结果与座位图完全一致（IndexedDB 持久化）；重复导入示例班级生成「副本」而非覆盖（`e2e/sample.spec.ts`）。
 
 ## 11. 边界（刻意不做）

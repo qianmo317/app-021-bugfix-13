@@ -36,7 +36,6 @@ interface Prepared {
   apartSet: Set<number>
   heights: Float64Array // -1 未知
   tier: Int8Array // 0 未知
-  weeks: number
   frontSeats: number
   heightRule: boolean
   mixTiers: boolean
@@ -100,7 +99,6 @@ function prepare(cls: ClassEntity): Prepared {
     apartSet,
     heights,
     tier,
-    weeks: cls.weeks,
     frontSeats: frontRows * cls.layout.cols,
     heightRule: cls.constraints.heightRule,
     mixTiers: cls.constraints.mixTiers,
@@ -145,34 +143,45 @@ interface History {
 }
 
 // 从已有排里重建历史状态（用于「从第 N 周起重排」时保留已过周次的影响）
+// 必须逐周累加全部已保留周次的位置分、前排次数与同桌次数——
+// 与 generatePlan 顺序生成时 finalize 逐周更新 hist 的口径完全一致，
+// 这样后续周次看到的历史状态才与「一次生成整学期」相同，补排/重排结果才能对上。
 function buildHistory(p: Prepared, assignments: Assignment[]): History {
   const cumScore = new Float64Array(p.n)
   const cumFront = new Float64Array(p.n)
   const deskCount = new Map<number, number>()
   const sorted = [...assignments].sort((a, b) => a.week - b.week)
-  const seatByStudent = new Map<number, number>()
-  const last = sorted[sorted.length - 1]
-  if (last) {
-    for (const [seatId, studentId] of Object.entries(last.map)) {
+  const cols = p.idx.layout.cols
+
+  for (const asg of sorted) {
+    // 本周 studentIdx → seatIdx，以及反向的 seatIdx → studentIdx
+    const seatOfSt = new Map<number, number>()
+    const stAtSeat = new Map<number, number>()
+    for (const [seatId, studentId] of Object.entries(asg.map)) {
       const st = p.stIdx.get(studentId)
       const seat = p.idx.byId.get(seatId)
       if (st === undefined || seat === undefined) continue
-      seatByStudent.set(st, seat.row * p.idx.layout.cols + seat.col)
+      const si = seat.row * cols + seat.col
+      seatOfSt.set(st, si)
+      stAtSeat.set(si, st)
+    }
+    // 逐人累加本周位置分与前排次数
+    for (const [st, si] of seatOfSt) {
+      cumScore[st] += p.idx.posScore[si]
+      if (p.idx.seats[si].row < p.frontRows) cumFront[st] += 1
+    }
+    // 本周同桌对计入累计：以座位邻接为准，按学生下标去重（与 finalize 的计数口径一致）
+    for (const [st, si] of seatOfSt) {
+      for (const nb of p.idx.deskmates[si]) {
+        const other = stAtSeat.get(nb)
+        if (other === undefined || other <= st) continue
+        const key = pairKey(st, other)
+        deskCount.set(key, (deskCount.get(key) ?? 0) + 1)
+      }
     }
   }
-  for (const [st] of seatByStudent) {
-    cumScore[st] = p.idx.posScore[seatByStudent.get(st) ?? 0]
-    cumFront[st] = 1
-  }
-  for (const [st, si] of seatByStudent) {
-    for (const nb of p.idx.deskmates[si]) {
-      const other = seatByStudent.get(nb)
-      if (other === undefined || other <= st) continue
-      deskCount.set(pairKey(st, other), 1)
-    }
-  }
-  const weeksDone = sorted.length
-  return { cumScore, cumFront, deskCount, weeksDone }
+
+  return { cumScore, cumFront, deskCount, weeksDone: sorted.length }
 }
 
 // ---------- 约束感知的初始分配：可选座位最少的学生先安置 ----------
@@ -267,11 +276,17 @@ class WeekState {
     this.seatOf = seatOf
     this.weekScore = new Float64Array(p.n)
     this.weekFront = new Float64Array(p.n)
-    this.idealF = (p.weeks * p.frontSeats) / p.n
+    // 前排次数的理想值按「当前累计周次」推进：已生成 weeksDone 周、本周是第
+    // weeksDone+1 周，则每人截至本周的理想前排次数 = 周次 × 前排座位数 / 人数。
+    // 关键：它只依赖已实际生成的周数，与计划总周数 cls.weeks 无关——否则先排
+    // 10 周再把周数调到 20 补齐时，每周的公平目标都变了，即便历史状态完全一致，
+    // 退火轨迹也会和「一次生成 20 周」分叉。
+    this.idealF = ((hist.weeksDone + 1) * p.frontSeats) / p.n
     for (let st = 0; st < p.n; st++) {
       const si = seatOf[st]
-      // 关键：以初始座位的分值/前排计数作为周内基线，之后在其上累加移动增量，
-      // 这样 finalize 时 hist 累计值 = 真实累计（初始 + 所有移动）
+      // 以初始座位的分值/前排计数作为周内基线，之后在其上累加交换增量；
+      // finalize 会把这两个值改写成「最终座位」的权威值再并入历史累计，
+      // 保证顺序生成与从已存 map 重建历史两条路径的累计值 bit 级一致。
       this.weekScore[st] = p.idx.posScore[si]
       this.weekFront[st] = p.idx.seats[si].row < p.frontRows ? 1 : 0
       const x = hist.cumScore[st] + this.weekScore[st]
@@ -532,6 +547,15 @@ class WeekState {
       const st = this.occ[si]
       if (st >= 0) map[p.idx.seats[si].id] = p.students[st].id
     }
+    // 以「最终座位」的位置分/前排标记作为本周权威值，而不是退火过程中
+    // 初始分值 + 逐次交换增量的望远镜累加——后者因浮点加法顺序与直接按
+    // 座位求和有 1 ULP 偏差。增量重排要从已存 map 重建历史，两边必须
+    // bit 级一致，否则退火里的接受判定会被那点偏差翻转，结果对不上。
+    for (let st = 0; st < p.n; st++) {
+      const si = this.seatOf[st]
+      this.weekScore[st] = p.idx.posScore[si]
+      this.weekFront[st] = p.idx.seats[si].row < p.frontRows ? 1 : 0
+    }
     for (let st = 0; st < p.n; st++) {
       this.hist.cumScore[st] += this.weekScore[st]
       this.hist.cumFront[st] += this.weekFront[st]
@@ -627,13 +651,13 @@ export function regenerateSingleWeek(cls: ClassEntity, week: number, opts?: GenO
 
 /** 生成缺失的周次（如 weeks 从 16 调到 20） */
 export function generateMissingWeeks(cls: ClassEntity, opts?: GenOptions): Assignment[] {
-  const existing = cls.assignments.length
-  if (existing >= cls.weeks) return cls.assignments
+  const lastWeek = cls.assignments.reduce((m, a) => Math.max(m, a.week), 0)
+  if (lastWeek >= cls.weeks) return cls.assignments
   const seed = opts?.seed ?? cls.seed
   const p = prepare(cls)
   const hist = buildHistory(p, cls.assignments)
   const out = cls.assignments.map((a) => ({ ...a, map: { ...a.map }, score: { ...a.score } }))
-  for (let week = existing + 1; week <= cls.weeks; week++) {
+  for (let week = lastWeek + 1; week <= cls.weeks; week++) {
     out.push(generateOneWeek(p, hist, week, seed))
   }
   return out
